@@ -14,8 +14,8 @@ num_clips = 5  # Number of audio clips to process
 sr = 32000  # Sample rate
 clip_duration = 5  # Audio segment length
 overlap = 3  # Overlap in audio (s)
-weight_audio_conf = 0.5  # Audio confidence weight
-weight_text_sim = 0.5  # Text similarity weight
+weight_audio_conf = 0.8  # Audio confidence weight
+weight_text_sim = 0.2  # Text similarity weight
 top_n_tags = 3  # Take the top 3 tags regardless of confidence
 
 nlp = spacy.load('en_core_web_sm')
@@ -40,25 +40,34 @@ def process_audio(audio_path):
 
     return tags_list
 
-def extract_nouns_and_verbs(captions_data):
-    connected_words = {}
+def extract_noun_verb_phrases(captions_data):
+    connected_phrases = {}
+
     for key, captions in list(captions_data.items())[:num_clips]:
-        # Combine all captions from different sources
-        all_captions = captions.get("audio_captions", []) + \
-                       captions.get("visual_captions", []) + \
-                       captions.get("audio_visual_captions", []) + \
-                       captions.get("GPT_AV_captions", [])
-        
-        connected_words[key] = {"nouns": [], "verbs": []}
-        
+        all_captions = captions.get("audio_captions", []) + captions.get("visual_captions", []) + captions.get("audio_visual_captions", []) + captions.get("GPT_AV_captions", [])
+
+        connected_phrases[key] = {"noun_verb_pairs": [], "compound_nouns": []}
+
         for caption in all_captions:
             doc = nlp(caption)
+            noun_verb_pairs = set()
+            compound_nouns = set()
+            
             for token in doc:
-                if token.pos_ == "NOUN":
-                    connected_words[key]["nouns"].append(token.text)
-                elif token.pos_ == "VERB":
-                    connected_words[key]["verbs"].append(token.text)
-    return connected_words
+                if token.pos_ == "VERB":
+                    for child in token.children:
+                        if child.dep_ in ("nsubj", "nsubjpass"): 
+                            phrase = f"{child.text} {token.text}"
+                            noun_verb_pairs.add(phrase)
+
+                if token.dep_ == "compound" and token.head.pos_ == "NOUN":
+                    phrase = f"{token.text} {token.head.text}"
+                    compound_nouns.add(phrase)
+
+            connected_phrases[key]["noun_verb_pairs"] = list(noun_verb_pairs)
+            connected_phrases[key]["compound_nouns"] = list(compound_nouns)
+
+    return connected_phrases
 
 # Similarity between audio tags and text captions
 def compute_similarity(audio_tags, caption_words):
@@ -100,26 +109,24 @@ if __name__ == "__main__":
             all_tags.append(tags)
             processed_clips += 1
 
-    connected_words = extract_nouns_and_verbs(captions_data)
+    connected_phrases = extract_noun_verb_phrases(captions_data)
 
     # Clip processing
     for i, clip_tags in enumerate(all_tags):
-        key = list(connected_words.keys())[i] if i < len(connected_words) else None
+        key = list(connected_phrases.keys())[i] if i < len(connected_phrases) else None
         if key:
-            caption_words = connected_words[key]['nouns'] + connected_words[key]['verbs']
+            caption_words = connected_phrases[key]["noun_verb_pairs"] + connected_phrases[key]["compound_nouns"]
 
-            # Print caption words only once at the top for the clip
             print(f"\nAudio Clip {i + 1} - Caption Words: {', '.join(caption_words)}")
             print("-" * 60)
             print(f"{'Segment':<10} {'Tag':<30} {'Audio Conf.':<15} {'Final Conf.':<15}")
             print("-" * 60)
 
-            # Process each segment in the clip and print the results neatly
             for j, segment_tags in enumerate(clip_tags):
                 final_scores = compute_similarity(segment_tags, caption_words)
 
-                if final_scores:  # Only add results if there are valid confidence scores
+                if final_scores:
                     for tag, audio_conf, final_conf in final_scores:
                         print(f"{j + 1:<10} {tag:<30} {audio_conf:.2f}         {final_conf:.2f}")
 
-            print("-" * 60)  # Separator between clips
+            print("-" * 60)
