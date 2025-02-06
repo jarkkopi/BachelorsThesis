@@ -1,0 +1,235 @@
+Version 1-
+
+Audio - using PANNS-inference audiotagging and labels.
+
+import os
+import librosa
+import numpy as np
+import json
+import spacy
+from panns_inference import AudioTagging, labels
+
+audio_folder = './data/test_audio_output'
+
+at = AudioTagging(checkpoint_path=None, device='cuda')
+
+sr = 32000 
+clip_duration = 5
+overlap = 2
+threshold = 0.5
+
+# process audio and extract tags
+def process_audio(audio_path):
+    audio, _ = librosa.load(audio_path, sr=sr, mono=True)
+
+    segment_length = int(clip_duration * sr)
+    hop_length = int((clip_duration - overlap) * sr)
+
+    # tags for each segment
+    tags_list = []
+    for start_idx in range(0, len(audio) - segment_length + 1, hop_length):
+        segment = audio[start_idx : start_idx + segment_length][None, :]  # (batch_size, segment_samples)
+
+        clipwise_output, _ = at.inference(segment)
+        tags = [labels[i] for i, score in enumerate(clipwise_output[0]) if score > threshold]
+
+        tags_list.append(tags)
+
+    return tags_list
+
+# first 10 audio clips
+all_tags = []
+processed_clips = 0
+for file_name in sorted(os.listdir(audio_folder)):
+    if processed_clips >= 10:
+        break
+
+    if file_name.endswith('.wav'):
+        audio_path = os.path.join(audio_folder, file_name)
+        tags = process_audio(audio_path)
+        all_tags.append(tags)
+        processed_clips += 1
+
+# results
+for i, clip_tags in enumerate(all_tags):
+    print(f"Audio Clip {i + 1} Tags:")
+    for j, segment_tags in enumerate(clip_tags):
+        print(f"  Segment {j + 1}: {segment_tags}")
+    print()
+
+Captions - using spacy to gather nouns and verbs
+
+import json
+import spacy
+
+json_file_path = './data/test_captions.json'
+nlp = spacy.load('en_core_web_sm')
+
+with open(json_file_path, 'r') as f:
+    captions_data = json.load(f)
+
+def extract_nouns_and_verbs(captions_data):
+    connected_words = {}
+
+    for key, captions in list(captions_data.items())[:10]:  # first ten
+        all_captions = captions.get("audio_captions", []) + captions.get("visual_captions", []) + captions.get("audio_visual_captions", []) + captions.get("GPT_AV_captions", [])
+        connected_words[key] = {"nouns": [], "verbs": []}
+
+        for caption in all_captions:
+            doc = nlp(caption)
+            """
+            for token in doc:
+                if token.pos_ in {"NOUN", "VERB"} and token.head.pos_ in {"NOUN", "VERB"}:
+                    connected_words[key].append((token.text, token.head.text))
+            """
+            for token in doc:
+                if token.pos_ == "NOUN":
+                    connected_words[key]["nouns"].append(token.text)
+                elif token.pos_ == "VERB":
+                    connected_words[key]["verbs"].append(token.text)
+    return connected_words
+
+connected_words = extract_nouns_and_verbs(captions_data)
+
+for key, words in connected_words.items():
+    print(f"Key: {key}")
+    """
+    print(f"Connected Nouns and Verbs: {words}")
+    """
+    print(f"Nouns: {words['nouns']}")
+    print(f"Verbs: {words['verbs']}")
+
+
+Version 2-
+
+Audio, captions, embeddings and SBERT
+
+import os
+import librosa
+import numpy as np
+import json
+import spacy
+from panns_inference import AudioTagging, labels
+from sentence_transformers import SentenceTransformer, util
+
+audio_folder = './data/test_audio_output'
+json_file_path = './data/test_captions.json'
+
+# parameters
+num_clips = 10  # Number of audio clips to process
+sr = 32000  # sr
+clip_duration = 5  # audio segment length
+overlap = 2  # overlap in audio (s)
+threshold = 0.5  # confidence threshold
+weight_audio_conf = 0.6  # audio confidence weight
+weight_text_sim = 0.4  # text similarity weight
+
+# Load models
+nlp = spacy.load('en_core_web_sm')
+sbert_model = SentenceTransformer('all-MiniLM-L6-v2')
+at = AudioTagging(checkpoint_path=None, device='cuda')
+
+# Process audio and extract tags
+def process_audio(audio_path):
+    audio, _ = librosa.load(audio_path, sr=sr, mono=True)
+    segment_length = int(clip_duration * sr)
+    hop_length = int((clip_duration - overlap) * sr)
+
+    tags_list = []
+    for start_idx in range(0, len(audio) - segment_length + 1, hop_length):
+        segment = audio[start_idx : start_idx + segment_length][None, :]
+        clipwise_output, _ = at.inference(segment)
+        tags = [(labels[i], score) for i, score in enumerate(clipwise_output[0]) if score > threshold]
+        tags_list.append(tags)
+    
+    return tags_list
+
+def extract_nouns_and_verbs(captions_data):
+    connected_words = {}
+    for key, captions in list(captions_data.items())[:num_clips]:
+        all_captions = captions.get("audio_captions", []) 
+        connected_words[key] = {"nouns": [], "verbs": []}
+        
+        for caption in all_captions:
+            doc = nlp(caption)
+            for token in doc:
+                if token.pos_ == "NOUN":
+                    connected_words[key]["nouns"].append(token.text)
+                elif token.pos_ == "VERB":
+                    connected_words[key]["verbs"].append(token.text)
+    return connected_words
+
+# similarity audio tags and captions
+def compute_similarity(audio_tags, caption_words):
+    if not caption_words:
+        return [(tag, conf * weight_audio_conf) for tag, conf in audio_tags]  # Reduce confidence if no matching words
+    
+    if not audio_tags:
+        return [] 
+
+    audio_labels = [tag for tag, _ in audio_tags]
+    audio_embeddings = sbert_model.encode(audio_labels)
+    text_embeddings = sbert_model.encode(caption_words) if caption_words else np.array([])
+    
+    if text_embeddings.shape[0] == 0:  # If no valid text embeddings
+        return [(tag, conf * weight_audio_conf) for tag, conf in audio_tags]
+
+    similarity_matrix = util.cos_sim(audio_embeddings, text_embeddings).numpy()
+    
+    confidence_scores = []
+    for i, (tag, conf) in enumerate(audio_tags):
+        max_sim = np.max(similarity_matrix[i]) if similarity_matrix.shape[1] > 0 else 0
+        final_conf = weight_audio_conf * conf + weight_text_sim * max_sim
+        confidence_scores.append((tag, final_conf))
+    
+    return confidence_scores
+
+if __name__ == "__main__":
+    with open(json_file_path, 'r') as f:
+        captions_data = json.load(f)
+
+    all_tags = []
+    processed_clips = 0
+    for file_name in sorted(os.listdir(audio_folder)):
+        if processed_clips >= num_clips:
+            break
+        if file_name.endswith('.wav'):
+            audio_path = os.path.join(audio_folder, file_name)
+            tags = process_audio(audio_path)
+            all_tags.append(tags)
+            processed_clips += 1
+
+    connected_words = extract_nouns_and_verbs(captions_data)
+
+    for i, clip_tags in enumerate(all_tags):
+        key = list(connected_words.keys())[i] if i < len(connected_words) else None
+        if key:
+            caption_words = connected_words[key]['nouns'] + connected_words[key]['verbs']
+            for j, segment_tags in enumerate(clip_tags):
+                final_scores = compute_similarity(segment_tags, caption_words)
+                print(f"Audio Clip {i + 1}, Segment {j + 1} Confidence Scores:")
+                for tag, score in final_scores:
+                    print(f"  Tag: {tag}, Confidence: {score:.2f}")
+                print()
+
+Version 3- printing tags in both:
+
+Add this code to compute_similarity:
+
+print("Audio Tags (Words):", audio_labels)
+print("Text (Words):", caption_words)
+
+
+Version 4-
+
+
+TO TEST:
+Different evaluation metrics (different distances/similarities (euclidian, manhattan))
+Preprocess - normalize, denoise audio; lemmatization/stemming (root form eg running -> run)
+Finetuning - PANNS, SentenceTransformer, domain-specific or general.
+Different models BERT, RoBERTa, GPT
+Expanding text matching, contextual similarity
+Cross-modal attention, instead of embeddings, attention mechanisms - relevance
+Dynamic thresholding
+Hyperparameter testing (grid search, random search, bayesian optimization) for best performance
+
