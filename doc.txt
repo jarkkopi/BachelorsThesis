@@ -804,6 +804,398 @@ if __name__ == "__main__":
 Version 8:
 Trying to process captions to match ontology:
 
+import os
+import librosa
+import numpy as np
+import json
+import spacy
+from panns_inference import AudioTagging, labels
+from sentence_transformers import SentenceTransformer, util
+from subject_verb_object import *
+
+audio_folder = './data/test_audio_output'
+json_file_path = './data/test_captions.json'
+
+# Parameters
+num_clips = 5  # Number of audio clips to process
+sr = 32000  # Sample rate
+clip_duration = 5  # Audio segment length
+overlap = 2  # Overlap in audio (s)
+weight_audio_conf = 0.5  # Audio confidence weight
+weight_text_sim = 0.5  # Text similarity weight
+top_n_tags = 3  # Take the top 3 tags regardless of confidence
+
+# Pre-trained model for sentence embeddings (SBERT)
+sbert_model = SentenceTransformer('all-MiniLM-L6-v2', device='cpu')
+at = AudioTagging(checkpoint_path=None, device='cpu')
+
+# Load AudioSet ontology labels
+audio_set_labels = labels  # Assuming labels are predefined
+
+# Function to compute similarity between caption words and AudioSet tags
+def compute_similarity(caption_words, audio_set_labels):
+    if not caption_words:
+        return []
+
+    # Compute embeddings for caption words and AudioSet labels
+    caption_embeddings = sbert_model.encode(caption_words, batch_size=32, show_progress_bar=False)
+    audio_embeddings = sbert_model.encode(audio_set_labels, batch_size=32, show_progress_bar=False)
+
+    # Compute cosine similarity between captions and AudioSet labels
+    similarity_matrix = util.cos_sim(caption_embeddings, audio_embeddings).numpy()
+
+    confidence_scores = []
+    for i, caption_word in enumerate(caption_words):
+        # Find the most similar AudioSet label
+        best_match_idx = np.argmax(similarity_matrix[i])
+        similarity_score = similarity_matrix[i][best_match_idx]
+
+        # If the similarity is high enough, add the AudioSet label
+        if similarity_score > 0.5:  # Set threshold for match
+            confidence_scores.append((audio_set_labels[best_match_idx], similarity_score))
+
+    return confidence_scores
+
+# Extract SVO (Subject-Verb-Object) triples and related phrases from audio captions
+def extract_svo_from_captions(captions_data):
+    nlp_svo = spacy.load('en_core_web_trf')  # Using transformer model for better accuracy
+
+    connected_phrases = {}
+
+    for key, captions in list(captions_data.items())[:num_clips]:
+        audio_captions = captions.get("audio_captions", [])  # Only use audio captions
+
+        connected_phrases[key] = {"svo_triples": [], "noun_phrases": [], "individual_words": []}
+
+        for caption in audio_captions:
+            doc = nlp_svo(caption)
+            svos = findSVAOs(doc)  # Extract Subject-Verb-Object triples
+
+            noun_phrases = set()
+            individual_words = set()
+
+            for chunk in doc.noun_chunks:
+                noun_phrases.add(chunk.text)
+
+            for token in doc:
+                if token.pos_ in {"NOUN", "VERB"}:
+                    individual_words.add(token.text)
+
+            connected_phrases[key]["svo_triples"].extend(svos)
+            connected_phrases[key]["noun_phrases"] = list(noun_phrases)
+            connected_phrases[key]["individual_words"] = list(individual_words)
+
+    return connected_phrases
+
+# Process audio and extract tags
+def process_audio(audio_path):
+    audio, _ = librosa.load(audio_path, sr=sr, mono=True)
+    segment_length = int(clip_duration * sr)
+    hop_length = int((clip_duration - overlap) * sr)
+
+    tags_list = []
+    clipwise_confidences = {}
+
+    for start_idx in range(0, len(audio) - segment_length + 1, hop_length):
+        segment = audio[start_idx : start_idx + segment_length][None, :]
+        clipwise_output, _ = at.inference(segment)
+
+        sorted_indices = np.argsort(clipwise_output[0])[::-1][:top_n_tags]
+        tags = [(labels[i], clipwise_output[0][i]) for i in sorted_indices]
+
+        # Store segment tags but do not print them
+        tags_list.append(tags)
+
+        # Track max confidence for each tag over all segments
+        for label, confidence in tags:
+            if label not in clipwise_confidences or confidence > clipwise_confidences[label]:
+                clipwise_confidences[label] = confidence
+
+    # Convert dictionary to sorted list based on confidence
+    clipwise_tags = sorted(clipwise_confidences.items(), key=lambda x: x[1], reverse=True)
+
+    return tags_list, clipwise_tags
+
+if __name__ == "__main__":
+    with open(json_file_path, 'r') as f:
+        captions_data = json.load(f)
+
+    connected_phrases = extract_svo_from_captions(captions_data)  # Extract SVO triples and phrases
+
+    all_tags = []
+    processed_clips = 0
+
+    # Process the audio files
+    for file_name in sorted(os.listdir(audio_folder)):
+        if processed_clips >= num_clips:
+            break
+        if file_name.endswith('.wav'):
+            audio_path = os.path.join(audio_folder, file_name)
+            segment_tags, clipwise_tags = process_audio(audio_path)
+            all_tags.append((segment_tags, clipwise_tags))  # Store both segment-wise and clip-level tags
+            processed_clips += 1
+
+    # Clip processing
+    for i, (segment_tags, clipwise_tags) in enumerate(all_tags):
+        file_name = sorted(os.listdir(audio_folder))[i]  # Get the current file name
+        file_number = file_name.split('.')[0]  # Remove the '.wav' extension and get the number
+        
+        key = list(connected_phrases.keys())[i] if i < len(connected_phrases) else None
+        if key:
+            caption_words = (
+                connected_phrases[key]["noun_phrases"] 
+                + connected_phrases[key]["individual_words"]
+            )
+
+            print(f"\n*")
+            print(f"SVO Triples: {connected_phrases[key]['svo_triples']}")
+            print(f"Extracted Words: {', '.join(caption_words)}")
+            print(f"*")
+
+            # Align caption words with AudioSet ontology
+            aligned_tags = compute_similarity(caption_words, audio_set_labels)
+            
+            print("-" * 80)
+            print(f"{'Tag':<30} {'Confidence Score':<15}")
+            print("-" * 80)
+
+            # Display aligned tags
+            for tag, conf in aligned_tags:
+                print(f"{tag:<30} {conf:.2f}")
+
+            print("-" * 80)
+
+
+Version 9. Finding best match for audioset ontology for extracted captions. Using multi-modal semantic mapping.
+did not work
+
+Version 10:
+
+-Direct comparison between each extracted element from caption and audio tag
+-Boosting according to similarity
+
+
+import os
+import librosa
+import numpy as np
+import json
+import spacy
+from panns_inference import AudioTagging, labels
+from sentence_transformers import SentenceTransformer, util
+from subject_verb_object import *
+
+audio_folder = './data/test_audio_output'
+json_file_path = './data/test_captions.json'
+
+# Parameters
+num_clips = 5  # Number of audio clips to process
+sr = 32000  # Sample rate
+clip_duration = 5  # Audio segment length
+overlap = 2  # Overlap in audio (s)
+weight_audio_conf = 0.4  # Audio confidence weight
+weight_caption_boost = 0.6  # Text similarity weight
+top_n_tags = 3  # Take the top 3 tags regardless of confidence
+
+# Pre-trained model for sentence embeddings (SBERT)
+sbert_model = SentenceTransformer('all-MiniLM-L6-v2', device='cpu')
+at = AudioTagging(checkpoint_path=None, device='cpu')
+
+# Load AudioSet ontology labels
+audio_set_labels = labels  # Assuming labels are predefined
+
+# Function to compute similarity between caption words and AudioSet tags
+def compute_similarity_boost(caption_element, audio_tag):
+    """Compute similarity between a caption element and an audio tag"""
+    # Encode both texts
+    caption_emb = sbert_model.encode([caption_element], show_progress_bar=False)
+    tag_emb = sbert_model.encode([audio_tag], show_progress_bar=False)
+    
+    # Compute cosine similarity
+    similarity = float(util.cos_sim(caption_emb, tag_emb)[0][0])
+    return similarity
+
+def boost_confidence(audio_tags, caption_elements):
+    """Boost audio tag confidence based on caption similarities"""
+    results = {}
+    
+    for tag, audio_conf in audio_tags:
+        # Initialize with original confidence
+        max_similarity = 0.0
+        matching_elements = []
+        
+        # Compare tag with each caption element
+        for element in caption_elements:
+            similarity = compute_similarity_boost(element, tag)
+            if similarity > max_similarity:
+                max_similarity = similarity
+            if similarity > 0.5:  # Track strong matches
+                matching_elements.append((element, similarity))
+        
+        # Calculate boost based on best similarity
+        if max_similarity > 0.5:
+            boost = max_similarity * weight_caption_boost
+            boosted_conf = min(audio_conf + boost, 1.0)
+        else:
+            boosted_conf = audio_conf
+        
+        results[tag] = {
+            'original': audio_conf,
+            'boosted': boosted_conf,
+            'max_similarity': max_similarity,
+            'matching_elements': matching_elements
+        }
+    
+    return results
+
+# Extract SVO (Subject-Verb-Object) triples and related phrases from audio captions
+def extract_svo_from_captions(captions_data):
+    nlp_svo = spacy.load('en_core_web_trf')  # Using transformer model for better accuracy
+
+    connected_phrases = {}
+
+    for key, captions in list(captions_data.items())[:num_clips]:
+        audio_captions = captions.get("audio_captions", [])  # Only use audio captions
+
+        connected_phrases[key] = {"svo_triples": [], "noun_phrases": [], "individual_words": []}
+
+        for caption in audio_captions:
+            doc = nlp_svo(caption)
+            svos = findSVAOs(doc)  # Extract Subject-Verb-Object triples
+
+            noun_phrases = set()
+            individual_words = set()
+
+            for chunk in doc.noun_chunks:
+                noun_phrases.add(chunk.text)
+
+            for token in doc:
+                if token.pos_ in {"NOUN", "VERB"}:
+                    individual_words.add(token.text)
+
+            connected_phrases[key]["svo_triples"].extend(svos)
+            connected_phrases[key]["noun_phrases"] = list(noun_phrases)
+            connected_phrases[key]["individual_words"] = list(individual_words)
+
+    return connected_phrases
+
+# Process audio and extract tags
+def process_audio(audio_path):
+    audio, _ = librosa.load(audio_path, sr=sr, mono=True)
+    segment_length = int(clip_duration * sr)
+    hop_length = int((clip_duration - overlap) * sr)
+
+    tags_list = []
+    clipwise_confidences = {}
+
+    for start_idx in range(0, len(audio) - segment_length + 1, hop_length):
+        segment = audio[start_idx : start_idx + segment_length][None, :]
+        clipwise_output, _ = at.inference(segment)
+
+        sorted_indices = np.argsort(clipwise_output[0])[::-1][:top_n_tags]
+        tags = [(labels[i], clipwise_output[0][i]) for i in sorted_indices]
+
+        # Store segment tags but do not print them
+        tags_list.append(tags)
+
+        # Track max confidence for each tag over all segments
+        for label, confidence in tags:
+            if label not in clipwise_confidences or confidence > clipwise_confidences[label]:
+                clipwise_confidences[label] = confidence
+
+    # Convert dictionary to sorted list based on confidence
+    clipwise_tags = sorted(clipwise_confidences.items(), key=lambda x: x[1], reverse=True)
+
+    return tags_list, clipwise_tags
+
+if __name__ == "__main__":
+    with open(json_file_path, 'r') as f:
+        captions_data = json.load(f)
+
+    connected_phrases = extract_svo_from_captions(captions_data)
+    all_tags = []
+    processed_clips = 0
+
+    # Process audio files
+    for file_name in sorted(os.listdir(audio_folder)):
+        if processed_clips >= num_clips:
+            break
+        if file_name.endswith('.wav'):
+            audio_path = os.path.join(audio_folder, file_name)
+            segment_tags, clipwise_tags = process_audio(audio_path)
+            all_tags.append((segment_tags, clipwise_tags))
+            processed_clips += 1
+
+    # Process each clip
+    for i, (segment_tags, clipwise_tags) in enumerate(all_tags):
+        file_name = sorted(os.listdir(audio_folder))[i]
+        key = list(connected_phrases.keys())[i] if i < len(connected_phrases) else None
+        
+        if key:
+            # Collect all caption elements
+            caption_elements = (
+                connected_phrases[key]["svo_triples"] +
+                connected_phrases[key]["noun_phrases"] +
+                connected_phrases[key]["individual_words"]
+            )
+
+            print(f"\n{'='*110}")
+            print(f"File: {file_name}")
+            print("\nCaption Elements:")
+            print(f"SVO Triples: {connected_phrases[key]['svo_triples']}")
+            print(f"Noun Phrases: {', '.join(connected_phrases[key]['noun_phrases'])}")
+            print(f"Individual Words: {', '.join(connected_phrases[key]['individual_words'])}")
+            
+            # Compute boosted confidences
+            results = boost_confidence(clipwise_tags, caption_elements)
+            
+            # Display results
+            print(f"\n{'='*110}")
+            print(f"Audio Tags with Caption-Based Confidence Boosting:")
+            print(f"{'-'*110}")
+            print(f"{'Tag':<30} {'Original':<10} {'Boosted':<10} {'Best Match':<40} {'Similarity':<10}")
+            print(f"{'-'*110}")
+            
+            sorted_results = sorted(
+                results.items(),
+                key=lambda x: x[1]['boosted'],
+                reverse=True
+            )
+            
+            for tag, info in sorted_results:
+                best_match = ""
+                if info['matching_elements']:
+                    best_match = max(info['matching_elements'], key=lambda x: x[1])[0]
+                
+                print(f"{tag:<30} {info['original']:<10.3f} {info['boosted']:<10.3f} "
+                      f"{best_match[:40]:<40} {info['max_similarity']:<10.3f}")
+            
+            print(f"{'='*110}")
+
+
+
+Next improvements:
+Multimodal Fusion of Audio and Caption Information
+• Currently you handle audio‐based tagging and also generate cosine similarities for caption–label alignment. Consider combining these scores in a more integrated multimodal fusion framework. For example, experiment with weighted score aggregation (which you already hint at with weight_audio_conf and weight_text_sim) but explore alternative functions (e.g., a logistic regression over the two scores, or even neural‐based fusion) so that captions have a bigger role when their confidence is high.
+• Investigate fusion at different levels (early fusion versus late fusion). You’re already performing late fusion by comparing confidence outputs from each branch. You might also consider concatenating the audio embeddings and caption embeddings (or features derived therefrom) and training a simple classifier that learns how to adjust for potential inconsistencies.
+
+Enhancing Caption Processing and Similarity Computation
+• Instead of treating each caption word individually (noun phrases and individual words) for computing cosine similarity with AudioSet tags, try to preserve context by feeding whole sentences or larger text chunks into your sentence transformer. This might yield embeddings that capture the semantics better than a bag-of-words–style approach.
+• In compute_similarity(), you take only the best-matching tag per word if the similarity exceeds a threshold. Consider either:
+– lowering the threshold with a soft aggregation (e.g., weighted average contributions from all caption words) or
+– returning multiple candidates per word, then aggregating over the entire caption. This could help capture multi-faceted contextual clues.
+• Look into using joint-embedding models for audio–text (e.g., CLAP or similar multimodal embeddings developed for audio data). This might better align the audio and caption modality within a common embedding space.
+
+Improvements in Audio Processing
+• Currently, you process audio in sliding windows with fixed clip_duration and overlap. Consider dynamic segmentation that might be sensitive to actual audio event boundaries (e.g., using an energy-based or onset detection algorithm) to help get more representative segments.
+• You may add windowing functions (e.g., Hamming or Hann windows) to reduce edge artifacts in the segments.
+
+Efficient and Robust Pipeline Enhancements
+• Model Initialization: Loading the large NLP model (“en_core_web_trf”) for every run might be optimized by ensuring it is loaded only once per session. Although your code already loads it inside the extract_svo_from_captions() function, further caching or even alternative lightweight models could be explored to reduce processing time.
+• Error Handling & Logging: Integrate logging and exception handling (for file I/O or inference errors) so that the experimental process is more robust, especially when scaling to larger datasets.
+• Tag Aggregation: When processing multiple segments, consider aggregating tag occurrences across segments not just by maximum confidence but by temporal consistency. This may enhance reliability if some events are intermittent.
+• Parameter Sensitivity: Experiment with different thresholds for cosine similarity (for instance, the 0.5 threshold) as well as the weightings for audio and text scores. Document the sensitivity analysis in your thesis to justify parameter choices.
+
+
 
 
 

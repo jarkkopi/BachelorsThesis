@@ -15,8 +15,8 @@ num_clips = 5  # Number of audio clips to process
 sr = 32000  # Sample rate
 clip_duration = 5  # Audio segment length
 overlap = 2  # Overlap in audio (s)
-weight_audio_conf = 0.5  # Audio confidence weight
-weight_text_sim = 0.5  # Text similarity weight
+weight_audio_conf = 0.4  # Audio confidence weight
+weight_caption_boost = 0.6  # Text similarity weight
 top_n_tags = 3  # Take the top 3 tags regardless of confidence
 
 # Pre-trained model for sentence embeddings (SBERT)
@@ -27,28 +27,48 @@ at = AudioTagging(checkpoint_path=None, device='cpu')
 audio_set_labels = labels  # Assuming labels are predefined
 
 # Function to compute similarity between caption words and AudioSet tags
-def compute_similarity(caption_words, audio_set_labels):
-    if not caption_words:
-        return []
+def compute_similarity_boost(caption_element, audio_tag):
+    """Compute similarity between a caption element and an audio tag"""
+    # Encode both texts
+    caption_emb = sbert_model.encode([caption_element], show_progress_bar=False)
+    tag_emb = sbert_model.encode([audio_tag], show_progress_bar=False)
+    
+    # Compute cosine similarity
+    similarity = float(util.cos_sim(caption_emb, tag_emb)[0][0])
+    return similarity
 
-    # Compute embeddings for caption words and AudioSet labels
-    caption_embeddings = sbert_model.encode(caption_words, batch_size=32, show_progress_bar=False)
-    audio_embeddings = sbert_model.encode(audio_set_labels, batch_size=32, show_progress_bar=False)
-
-    # Compute cosine similarity between captions and AudioSet labels
-    similarity_matrix = util.cos_sim(caption_embeddings, audio_embeddings).numpy()
-
-    confidence_scores = []
-    for i, caption_word in enumerate(caption_words):
-        # Find the most similar AudioSet label
-        best_match_idx = np.argmax(similarity_matrix[i])
-        similarity_score = similarity_matrix[i][best_match_idx]
-
-        # If the similarity is high enough, add the AudioSet label
-        if similarity_score > 0.5:  # Set threshold for match
-            confidence_scores.append((audio_set_labels[best_match_idx], similarity_score))
-
-    return confidence_scores
+def boost_confidence(audio_tags, caption_elements):
+    """Boost audio tag confidence based on caption similarities"""
+    results = {}
+    
+    for tag, audio_conf in audio_tags:
+        # Initialize with original confidence
+        max_similarity = 0.0
+        matching_elements = []
+        
+        # Compare tag with each caption element
+        for element in caption_elements:
+            similarity = compute_similarity_boost(element, tag)
+            if similarity > max_similarity:
+                max_similarity = similarity
+            if similarity > 0.5:  # Track strong matches
+                matching_elements.append((element, similarity))
+        
+        # Calculate boost based on best similarity
+        if max_similarity > 0.5:
+            boost = max_similarity * weight_caption_boost
+            boosted_conf = min(audio_conf + boost, 1.0)
+        else:
+            boosted_conf = audio_conf
+        
+        results[tag] = {
+            'original': audio_conf,
+            'boosted': boosted_conf,
+            'max_similarity': max_similarity,
+            'matching_elements': matching_elements
+        }
+    
+    return results
 
 # Extract SVO (Subject-Verb-Object) triples and related phrases from audio captions
 def extract_svo_from_captions(captions_data):
@@ -114,47 +134,62 @@ if __name__ == "__main__":
     with open(json_file_path, 'r') as f:
         captions_data = json.load(f)
 
-    connected_phrases = extract_svo_from_captions(captions_data)  # Extract SVO triples and phrases
-
+    connected_phrases = extract_svo_from_captions(captions_data)
     all_tags = []
     processed_clips = 0
 
-    # Process the audio files
+    # Process audio files
     for file_name in sorted(os.listdir(audio_folder)):
         if processed_clips >= num_clips:
             break
         if file_name.endswith('.wav'):
             audio_path = os.path.join(audio_folder, file_name)
             segment_tags, clipwise_tags = process_audio(audio_path)
-            all_tags.append((segment_tags, clipwise_tags))  # Store both segment-wise and clip-level tags
+            all_tags.append((segment_tags, clipwise_tags))
             processed_clips += 1
 
-    # Clip processing
+    # Process each clip
     for i, (segment_tags, clipwise_tags) in enumerate(all_tags):
-        file_name = sorted(os.listdir(audio_folder))[i]  # Get the current file name
-        file_number = file_name.split('.')[0]  # Remove the '.wav' extension and get the number
-        
+        file_name = sorted(os.listdir(audio_folder))[i]
         key = list(connected_phrases.keys())[i] if i < len(connected_phrases) else None
+        
         if key:
-            caption_words = (
-                connected_phrases[key]["noun_phrases"] 
-                + connected_phrases[key]["individual_words"]
+            # Collect all caption elements
+            caption_elements = (
+                connected_phrases[key]["svo_triples"] +
+                connected_phrases[key]["noun_phrases"] +
+                connected_phrases[key]["individual_words"]
             )
 
-            print(f"\n*")
+            print(f"\n{'='*110}")
+            print(f"File: {file_name}")
+            print("\nCaption Elements:")
             print(f"SVO Triples: {connected_phrases[key]['svo_triples']}")
-            print(f"Extracted Words: {', '.join(caption_words)}")
-            print(f"*")
-
-            # Align caption words with AudioSet ontology
-            aligned_tags = compute_similarity(caption_words, audio_set_labels)
+            print(f"Noun Phrases: {', '.join(connected_phrases[key]['noun_phrases'])}")
+            print(f"Individual Words: {', '.join(connected_phrases[key]['individual_words'])}")
             
-            print("-" * 80)
-            print(f"{'Tag':<30} {'Confidence Score':<15}")
-            print("-" * 80)
-
-            # Display aligned tags
-            for tag, conf in aligned_tags:
-                print(f"{tag:<30} {conf:.2f}")
-
-            print("-" * 80)
+            # Compute boosted confidences
+            results = boost_confidence(clipwise_tags, caption_elements)
+            
+            # Display results
+            print(f"\n{'='*110}")
+            print(f"Audio Tags with Caption-Based Confidence Boosting:")
+            print(f"{'-'*110}")
+            print(f"{'Tag':<30} {'Original':<10} {'Boosted':<10} {'Best Match':<40} {'Similarity':<10}")
+            print(f"{'-'*110}")
+            
+            sorted_results = sorted(
+                results.items(),
+                key=lambda x: x[1]['boosted'],
+                reverse=True
+            )
+            
+            for tag, info in sorted_results:
+                best_match = ""
+                if info['matching_elements']:
+                    best_match = max(info['matching_elements'], key=lambda x: x[1])[0]
+                
+                print(f"{tag:<30} {info['original']:<10.3f} {info['boosted']:<10.3f} "
+                      f"{best_match[:40]:<40} {info['max_similarity']:<10.3f}")
+            
+            print(f"{'='*110}")
