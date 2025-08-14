@@ -21,7 +21,6 @@ predictions_df.set_index('filename', inplace=True)
 num_clips = 10
 top_n_tags = 3
 
-# ground_truth_tags_dict should be defined here or loaded accordingly
 ground_truth_tags_dict = {
     "4963357278.wav": ['Child speech, kid speaking', 'Speech'],
     "4964516093.wav": ['Child speech, kid speaking', 'Children playing', 'Laughter', 'Speech'],
@@ -459,32 +458,6 @@ def boost_confidence_ratio(audio_tags, caption_elements, audio_captions, alpha=0
             'match_ratio': f"{match_count}/{num_captions} ({match_ratio:.3f})",
         }
     return results
-"""
-def extract_caption_phrases(captions_data):
-    connected_phrases = {}
-
-    for key, captions in captions_data.items():
-        audio_captions = captions.get("audio_captions", [])
-        connected_phrases[key] = {"all_phrases": []}
-
-        for caption in audio_captions:
-            doc = nlp_svo(caption)
-            phrases = set()
-
-            for chunk in doc.noun_chunks:
-                cleaned = chunk.text.strip().lower()
-                if len(cleaned) > 1:
-                    phrases.add(cleaned)
-
-            # Add verbs (lemmas)
-            for token in doc:
-                if token.pos_ == "VERB" and token.lemma_ not in nlp_svo.Defaults.stop_words:
-                    phrases.add(token.lemma_)
-
-            connected_phrases[key]["all_phrases"].extend(list(phrases))
-
-    return connected_phrases
-"""
 
 def extract_caption_phrases(captions_data):
     connected_phrases = {}
@@ -658,3 +631,4 @@ if __name__ == "__main__":
     plt.grid(True)
     plt.tight_layout()
     plt.show()
+
