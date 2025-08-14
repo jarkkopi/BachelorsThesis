@@ -1,6 +1,6 @@
 # Bachelor's thesis
 Bachelor's thesis experimental part.
-This bachelor's thesis was expanded on, through which a workshop paper was created.
+This bachelor's thesis was expanded on, through which a workshop paper was created for DCASE workshop 2025.
 
 Abstract—Many audio datasets lack proper audio tags, meaning the
  annotations are not complete or accurate, limiting their usability. While
